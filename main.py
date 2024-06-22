@@ -1,12 +1,17 @@
 from math import pi, sin, cos
-
 from direct.showbase.ShowBase import ShowBase
 from panda3d.core import loadPrcFile
 from panda3d.core import DirectionalLight, AmbientLight
 from panda3d.core import TransparencyAttrib
 from panda3d.core import WindowProperties
-from panda3d.core import CollisionTraverser, CollisionNode, CollisionBox, CollisionRay, CollisionHandlerQueue
+from panda3d.core import CollisionTraverser, CollisionNode, CollisionBox, CollisionRay, CollisionHandlerQueue, CollisionSphere, CollisionHandlerPusher, BitMask32
+from panda3d.core import GeomNode  # Import for debugging collision nodes
 from direct.gui.OnscreenImage import OnscreenImage
+from direct.task import Task
+from panda3d.core import ClockObject
+
+# Initialize globalClock
+globalClock = ClockObject.getGlobalClock()
 
 loadPrcFile('settings.prc')
 
@@ -18,81 +23,161 @@ class MyGame(ShowBase):
         ShowBase.__init__(self)
 
         self.selectedBlockType = 'grass'
+        self.isJumping = False
+        self.isCrouching = False
+        self.jumpSpeed = 15
+        self.gravity = -30
+        self.zVelocity = 0
+        self.onGround = False
 
         self.loadModels()
         self.setupLights()
         self.generateTerrain()
         self.setupCamera()
         self.setupSkybox()
+        
+        self.cameraSwingActivated = False
+        self.lastMouseX = 0
+        self.lastMouseY = 0
+        
         self.captureMouse()
         self.setupControls()
 
-        taskMgr.add(self.update, 'update')
+        self.taskMgr.add(self.update, 'update')
+        self.taskMgr.add(self.fixedUpdate, 'fixedUpdate')
+
+        self.cTrav = CollisionTraverser()
+        self.rayQueue = CollisionHandlerQueue()
+        self.pusher = CollisionHandlerPusher()
+        self.setupCollision()
+
+    def setupCollision(self):
+        ray = CollisionRay()
+        ray.setFromLens(self.camNode, (0, 0))
+        rayNode = CollisionNode('line-of-sight')
+        rayNode.addSolid(ray)
+        rayNode.setIntoCollideMask(BitMask32.bit(1))
+        rayNodePath = self.camera.attachNewNode(rayNode)
+        self.cTrav.addCollider(rayNodePath, self.rayQueue)
+
+        playerCollider = CollisionSphere(0, 0, 0, 1)
+        playerNode = CollisionNode('player')
+        playerNode.addSolid(playerCollider)
+        playerNode.setFromCollideMask(BitMask32.bit(0))
+        playerNode.setIntoCollideMask(BitMask32.allOff())
+        playerNodePath = self.camera.attachNewNode(playerNode)
+        self.pusher.addCollider(playerNodePath, self.camera)
+        self.cTrav.addCollider(playerNodePath, self.pusher)
+        self.pusher.add_in_pattern('%fn-into-%in')
+        self.accept('player-into-block-collision-node', self.onCollision)
+
+    def onCollision(self, entry):
+        into_normal = entry.getSurfaceNormal(entry.getIntoNodePath())
+        if into_normal.z > 0.7:  # Ground collision
+            self.isJumping = False
+            self.zVelocity = 0
+            self.onGround = True
+            # Adjust the camera to be slightly above the ground to avoid getting stuck
+            self.camera.setZ(entry.getSurfacePoint(entry.getIntoNodePath()).getZ() + 0.1)
+        elif into_normal.z < -0.7:  # Ceiling collision
+            self.zVelocity = 0
+        else:  # Wall collision
+            # Adjust the position to avoid getting stuck inside walls
+            displacement = entry.getSurfaceNormal(entry.getIntoNodePath()) * 0.1
+            self.camera.setPos(self.camera.getPos() - displacement)
+
+    def fixedUpdate(self, task):
+        fixed_dt = 1 / 60
+        self.updateMovement(fixed_dt)
+        return task.again
 
     def update(self, task):
         dt = globalClock.getDt()
+        self.updateCameraSwing()
+        return task.cont
 
+    def updateMovement(self, dt):
         playerMoveSpeed = 10
 
         x_movement = 0
         y_movement = 0
-        z_movement = 0
 
         if self.keyMap['forward']:
-            x_movement -= dt * playerMoveSpeed * sin(degToRad(camera.getH()))
-            y_movement += dt * playerMoveSpeed * cos(degToRad(camera.getH()))
+            x_movement -= dt * playerMoveSpeed * sin(degToRad(self.camera.getH()))
+            y_movement += dt * playerMoveSpeed * cos(degToRad(self.camera.getH()))
         if self.keyMap['backward']:
-            x_movement += dt * playerMoveSpeed * sin(degToRad(camera.getH()))
-            y_movement -= dt * playerMoveSpeed * cos(degToRad(camera.getH()))
+            x_movement += dt * playerMoveSpeed * sin(degToRad(self.camera.getH()))
+            y_movement -= dt * playerMoveSpeed * cos(degToRad(self.camera.getH()))
         if self.keyMap['left']:
-            x_movement -= dt * playerMoveSpeed * cos(degToRad(camera.getH()))
-            y_movement -= dt * playerMoveSpeed * sin(degToRad(camera.getH()))
+            x_movement -= dt * playerMoveSpeed * cos(degToRad(self.camera.getH()))
+            y_movement -= dt * playerMoveSpeed * sin(degToRad(self.camera.getH()))
         if self.keyMap['right']:
-            x_movement += dt * playerMoveSpeed * cos(degToRad(camera.getH()))
-            y_movement += dt * playerMoveSpeed * sin(degToRad(camera.getH()))
-        if self.keyMap['up']:
-            z_movement += dt * playerMoveSpeed
-        if self.keyMap['down']:
-            z_movement -= dt * playerMoveSpeed
+            x_movement += dt * playerMoveSpeed * cos(degToRad(self.camera.getH()))
+            y_movement += dt * playerMoveSpeed * sin(degToRad(self.camera.getH()))
 
-        camera.setPos(
-            camera.getX() + x_movement,
-            camera.getY() + y_movement,
-            camera.getZ() + z_movement,
-        )
+        newPos = self.camera.getPos() + (x_movement, y_movement, 0)
+        self.camera.setPos(newPos)
 
+        if not self.onGround:
+            self.zVelocity += self.gravity * dt
+        else:
+            self.zVelocity = 0
+
+        self.zVelocity = max(self.zVelocity, -50)
+
+        newZPos = self.camera.getZ() + self.zVelocity * dt
+        self.camera.setZ(newZPos)
+
+        if self.camera.getZ() < -100:
+            self.camera.setPos(0, 0, 3)
+            self.zVelocity = 0
+
+        if self.keyMap['jump'] and self.onGround:
+            self.isJumping = True
+            self.onGround = False
+            self.zVelocity = self.jumpSpeed
+
+        if self.keyMap['crouch']:
+            if not self.isCrouching:
+                self.camera.setZ(self.camera.getZ() - 0.5)
+                self.isCrouching = True
+        else:
+            if self.isCrouching:
+                self.camera.setZ(self.camera.getZ() + 0.5)
+                self.isCrouching = False
+
+    def updateCameraSwing(self):
         if self.cameraSwingActivated:
             md = self.win.getPointer(0)
             mouseX = md.getX()
             mouseY = md.getY()
+            windowCenterX = self.win.getXSize() // 2
+            windowCenterY = self.win.getYSize() // 2
 
-            mouseChangeX = mouseX - self.lastMouseX
-            mouseChangeY = mouseY - self.lastMouseY
+            mouseChangeX = mouseX - windowCenterX
+            mouseChangeY = mouseY - windowCenterY
 
-            self.cameraSwingFactor = 10
+            self.cameraSwingFactor = 0.1
 
             currentH = self.camera.getH()
             currentP = self.camera.getP()
 
             self.camera.setHpr(
-                currentH - mouseChangeX * dt * self.cameraSwingFactor,
-                min(90, max(-90, currentP - mouseChangeY * dt * self.cameraSwingFactor)),
+                currentH - mouseChangeX * self.cameraSwingFactor,
+                min(90, max(-90, currentP - mouseChangeY * self.cameraSwingFactor)),
                 0
             )
 
-            self.lastMouseX = mouseX
-            self.lastMouseY = mouseY
+            self.win.movePointer(0, windowCenterX, windowCenterY)
 
-        return task.cont
-    
     def setupControls(self):
         self.keyMap = {
             "forward": False,
             "backward": False,
             "left": False,
             "right": False,
-            "up": False,
-            "down": False,
+            "jump": False,
+            "crouch": False,
         }
 
         self.accept('escape', self.releaseMouse)
@@ -107,10 +192,10 @@ class MyGame(ShowBase):
         self.accept('s-up', self.updateKeyMap, ['backward', False])
         self.accept('d', self.updateKeyMap, ['right', True])
         self.accept('d-up', self.updateKeyMap, ['right', False])
-        self.accept('space', self.updateKeyMap, ['up', True])
-        self.accept('space-up', self.updateKeyMap, ['up', False])
-        self.accept('lshift', self.updateKeyMap, ['down', True])
-        self.accept('lshift-up', self.updateKeyMap, ['down', False])
+        self.accept('space', self.updateKeyMap, ['jump', True])
+        self.accept('space-up', self.updateKeyMap, ['jump', False])
+        self.accept('lcontrol', self.updateKeyMap, ['crouch', True])
+        self.accept('lcontrol-up', self.updateKeyMap, ['crouch', False])
 
         self.accept('1', self.setSelectedBlockType, ['grass'])
         self.accept('2', self.setSelectedBlockType, ['dirt'])
@@ -131,11 +216,11 @@ class MyGame(ShowBase):
 
             hitNodePath = rayHit.getIntoNodePath()
             hitObject = hitNodePath.getPythonTag('owner')
-            distanceFromPlayer = hitObject.getDistance(self.camera)
-
-            if distanceFromPlayer < 12:
-                hitNodePath.clearPythonTag('owner')
-                hitObject.removeNode()
+            if hitObject:
+                distanceFromPlayer = hitObject.getDistance(self.camera)
+                if distanceFromPlayer < 12:
+                    hitNodePath.clearPythonTag('owner')
+                    hitObject.removeNode()
 
     def placeBlock(self):
         if self.rayQueue.getNumEntries() > 0:
@@ -144,12 +229,12 @@ class MyGame(ShowBase):
             hitNodePath = rayHit.getIntoNodePath()
             normal = rayHit.getSurfaceNormal(hitNodePath)
             hitObject = hitNodePath.getPythonTag('owner')
-            distanceFromPlayer = hitObject.getDistance(self.camera)
-
-            if distanceFromPlayer < 14:
-                hitBlockPos = hitObject.getPos()
-                newBlockPos = hitBlockPos + normal * 2
-                self.createNewBlock(newBlockPos.x, newBlockPos.y, newBlockPos.z, self.selectedBlockType)
+            if hitObject:
+                distanceFromPlayer = hitObject.getDistance(self.camera)
+                if distanceFromPlayer < 14:
+                    hitBlockPos = hitObject.getPos()
+                    newBlockPos = hitBlockPos + normal * 2
+                    self.createNewBlock(newBlockPos.x, newBlockPos.y, newBlockPos.z, self.selectedBlockType)
     
     def updateKeyMap(self, key, value):
         self.keyMap[key] = value
@@ -163,8 +248,12 @@ class MyGame(ShowBase):
 
         properties = WindowProperties()
         properties.setCursorHidden(True)
-        properties.setMouseMode(WindowProperties.M_relative)
+        properties.setMouseMode(WindowProperties.M_absolute)
         self.win.requestProperties(properties)
+
+        windowCenterX = self.win.getXSize() // 2
+        windowCenterY = self.win.getYSize() // 2
+        self.win.movePointer(0, windowCenterX, windowCenterY)
 
     def releaseMouse(self):
         self.cameraSwingActivated = False
@@ -180,28 +269,19 @@ class MyGame(ShowBase):
         self.camLens.setFov(80)
 
         crosshairs = OnscreenImage(
-            image = 'crosshairs.png',
-            pos = (0, 0, 0),
-            scale = 0.05,
+            image='crosshairs.png',
+            pos=(0, 0, 0),
+            scale=0.05,
         )
         crosshairs.setTransparency(TransparencyAttrib.MAlpha)
 
-        self.cTrav = CollisionTraverser()
-        ray = CollisionRay()
-        ray.setFromLens(self.camNode, (0, 0))
-        rayNode = CollisionNode('line-of-sight')
-        rayNode.addSolid(ray)
-        rayNodePath = self.camera.attachNewNode(rayNode)
-        self.rayQueue = CollisionHandlerQueue()
-        self.cTrav.addCollider(rayNodePath, self.rayQueue)
-
     def setupSkybox(self):
-        skybox = loader.loadModel('skybox/skybox.egg')
+        skybox = self.loader.loadModel('skybox/skybox.egg')
         skybox.setScale(500)
         skybox.setBin('background', 1)
         skybox.setDepthWrite(0)
         skybox.setLightOff()
-        skybox.reparentTo(render)
+        skybox.reparentTo(self.render)
     
     def generateTerrain(self):
         for z in range(10):
@@ -214,9 +294,8 @@ class MyGame(ShowBase):
                         'grass' if z == 0 else 'dirt'
                     )
 
-
     def createNewBlock(self, x, y, z, type):
-        newBlockNode = render.attachNewNode('new-block-placeholder')
+        newBlockNode = self.render.attachNewNode('new-block-placeholder')
         newBlockNode.setPos(x, y, z)
 
         if type == 'grass':
@@ -231,25 +310,26 @@ class MyGame(ShowBase):
         blockSolid = CollisionBox((-1, -1, -1), (1, 1, 1))
         blockNode = CollisionNode('block-collision-node')
         blockNode.addSolid(blockSolid)
+        blockNode.setIntoCollideMask(BitMask32.bit(0))
         collider = newBlockNode.attachNewNode(blockNode)
         collider.setPythonTag('owner', newBlockNode)
 
     def loadModels(self):
-        self.grassBlock = loader.loadModel('grass-block.glb')
-        self.dirtBlock = loader.loadModel('dirt-block.glb')
-        self.stoneBlock = loader.loadModel('stone-block.glb')
-        self.sandBlock = loader.loadModel('sand-block.glb')
+        self.grassBlock = self.loader.loadModel('grass-block.glb')
+        self.dirtBlock = self.loader.loadModel('dirt-block.glb')
+        self.stoneBlock = self.loader.loadModel('stone-block.glb')
+        self.sandBlock = self.loader.loadModel('sand-block.glb')
 
     def setupLights(self):
         mainLight = DirectionalLight('main light')
-        mainLightNodePath = render.attachNewNode(mainLight)
+        mainLightNodePath = self.render.attachNewNode(mainLight)
         mainLightNodePath.setHpr(30, -60, 0)
-        render.setLight(mainLightNodePath)
+        self.render.setLight(mainLightNodePath)
 
         ambientLight = AmbientLight('ambient light')
         ambientLight.setColor((0.3, 0.3, 0.3, 1))
-        ambientLightNodePath = render.attachNewNode(ambientLight)
-        render.setLight(ambientLightNodePath)
+        ambientLightNodePath = self.render.attachNewNode(ambientLight)
+        self.render.setLight(ambientLightNodePath)
     
 game = MyGame()
 game.run()
